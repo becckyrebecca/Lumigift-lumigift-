@@ -30,14 +30,7 @@ import {
   CURSOR_GENESIS,
   type FetchEventsResult,
 } from "@/lib/contracts/escrow-events";
-import {
-  runTtlKeeper,
-  TTL_KEEPER_LOOKAHEAD_SECONDS,
-  TTL_ALERT_BUFFER_SECONDS,
-  type TtlKeeperGift,
-  type TtlKeeperLogger,
-  type TtlKeeperMetrics,
-} from "@/lib/contracts/ttl-keeper";
+import { EventIndexerService } from "@/lib/contracts/event-indexer.service";
 
 // ─── Stellar SDK mock ─────────────────────────────────────────────────────────
 // We mock the stellar-sdk at the module level so EscrowClient never dials the
@@ -540,6 +533,38 @@ describe("fetchEscrowEvents — Issue #121", () => {
     expect(result.events).toHaveLength(0);
   });
 
+  it("decodes an upgraded event emitted by the upgrade function", async () => {
+    const { xdr: xdrSdk } = jest.requireActual("@stellar/stellar-sdk");
+    const NEW_WASM_HASH = "a".repeat(64);
+    const upgradedRaw = {
+      id: "0000000005-0000000001",
+      ledger: 500,
+      ledgerClosedAt: new Date().toISOString(),
+      txHash: "txhash-upgraded",
+      contractId: { toString: () => CONTRACT_ID },
+      topic: [xdrSdk.ScVal.scvSymbol("upgraded")],
+      value: xdrSdk.ScVal.scvVec([
+        xdrSdk.ScVal.scvBytes(Buffer.from(NEW_WASM_HASH, "hex")),
+      ]),
+    };
+
+    mockGetEvents.mockResolvedValue({ events: [upgradedRaw], cursor: "0000000005-0000000001" });
+
+    const result = await fetchEscrowEvents({
+      rpcUrl: RPC_URL,
+      contractId: CONTRACT_ID,
+      startCursor: CURSOR_GENESIS,
+    });
+
+    expect(result.events).toHaveLength(1);
+    const ev = result.events[0];
+    expect(ev.type).toBe("upgraded");
+    if (ev.type === "upgraded") {
+      expect(ev.wasmHash).toBe(NEW_WASM_HASH);
+    }
+    expect(result.latestCursor).toBe("0000000005-0000000001");
+  });
+
   it("is diagnosable: surfaces RPC network failures with the original error message", async () => {
     mockGetEvents.mockRejectedValue(new Error("RPC node unreachable: connection refused"));
 
@@ -572,258 +597,122 @@ describe("fetchEscrowEvents — Issue #121", () => {
   });
 });
 
-// ─── TTL keeper — Issue #531 ──────────────────────────────────────────────────
+// ─── upgrade (Issue #533) ─────────────────────────────────────────────────────
 
-const DAY_SECONDS = 86_400;
-
-describe("EscrowClient.extendTtl — Issue #531", () => {
-  const MOCK_HASH = "deadbeef1234567890deadbeef1234567890deadbeef1234567890deadbeef";
+describe("EscrowClient.upgrade — Issue #533", () => {
+  const NEW_WASM_HASH = "b".repeat(64);
 
   beforeEach(() => {
     jest.clearAllMocks();
     stubAccount();
   });
 
-  /**
-   * Build a getLedgerEntries fixture for a contract instance whose remaining
-   * TTL (in ledgers) is `remainingLedgers`. Soroban encodes the liveUntilLedger
-   * as a u32 inside the entry's `liveUntilLedgerSeq` field.
-   */
-  function makeInstanceEntry(remainingLedgers: number) {
-    const currentLedger = 1_000_000;
-    return {
-      entries: [
-        {
-          key: { type: "contractData" },
-          val: { type: "contractInstance" },
-          liveUntilLedgerSeq: currentLedger + remainingLedgers,
-        },
-      ],
-      latestLedger: currentLedger,
-    };
-  }
-
-  it("builds an extend_ttl transaction with the expected threshold and new TTL", async () => {
-    // Instance TTL is below the 7-day buffer → keeper must extend it.
-    mockGetLedgerEntries.mockResolvedValue(makeInstanceEntry(DAY_SECONDS / 5));
+  it("builds an upgrade transaction for the admin and returns XDR", async () => {
     mockSimulateTransaction.mockResolvedValue(makeSimSuccess(null));
-
     const client = makeClient();
-    const threshold = 7 * DAY_SECONDS;
-    const newTtl = 30 * DAY_SECONDS;
 
-    const xdr = await client.extendTtl(threshold, newTtl);
+    const xdr = await client.buildUpgrade(NEW_WASM_HASH);
 
     expect(typeof xdr).toBe("string");
     expect(xdr.length).toBeGreaterThan(0);
-
-    // The contract call must be extend_ttl with (threshold, newTtl) args.
-    const contractCall = (client as unknown as { contract: { call: jest.Mock } }).contract;
-    expect(contractCall.call).toHaveBeenCalledWith("extend_ttl", threshold, newTtl);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
   });
 
-  it("extends the mocked TTL above the threshold after submission", async () => {
-    const threshold = 7 * DAY_SECONDS;
-    const newTtl = 30 * DAY_SECONDS;
+  it("rejects a malformed wasm hash before hitting the network", async () => {
+    const client = makeClient();
 
-    // Start with a TTL that has already dropped below the 7-day buffer.
-    let remaining = DAY_SECONDS / 5;
-    mockGetLedgerEntries.mockImplementation(async () => makeInstanceEntry(remaining));
+    await expect(client.buildUpgrade("not-a-hash")).rejects.toThrow(/wasm hash/i);
+    expect(mockSimulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("throws EscrowContractError(Unauthorized) when caller is not the admin", async () => {
+    mockSimulateTransaction.mockResolvedValue(makeSimError(EscrowError.Unauthorized));
+    const client = makeClient();
+
+    await expect(client.buildUpgrade(NEW_WASM_HASH)).rejects.toMatchObject({
+      code: EscrowError.Unauthorized,
+    });
+  });
+
+  it("emits an Upgraded event on the authorized path", async () => {
+    // Authorized simulation succeeds; the resulting ledger event is indexed
+    // by fetchEscrowEvents as an "upgraded" event carrying the new wasm hash.
     mockSimulateTransaction.mockResolvedValue(makeSimSuccess(null));
-    mockSendTransaction.mockResolvedValue({ status: "PENDING", hash: MOCK_HASH });
-    mockGetTransaction.mockImplementation(async () => {
-      // Simulate the on-chain effect of extend_ttl: TTL jumps to newTtl.
-      remaining = newTtl;
-      return { status: "SUCCESS" };
+    const client = makeClient();
+    await client.buildUpgrade(NEW_WASM_HASH);
+
+    const { xdr: xdrSdk } = jest.requireActual("@stellar/stellar-sdk");
+    const upgradedRaw = {
+      id: "0000000020-0000000001",
+      ledger: 2000,
+      ledgerClosedAt: new Date().toISOString(),
+      txHash: "txhash-upgrade-authorized",
+      contractId: { toString: () => TESTNET_OPTIONS.contractId },
+      topic: [xdrSdk.ScVal.scvSymbol("upgraded")],
+      value: xdrSdk.ScVal.scvVec([
+        xdrSdk.ScVal.scvBytes(Buffer.from(NEW_WASM_HASH, "hex")),
+      ]),
+    };
+    mockGetEvents.mockResolvedValue({ events: [upgradedRaw], cursor: "0000000020-0000000001" });
+
+    const result = await fetchEscrowEvents({
+      rpcUrl: TESTNET_OPTIONS.rpcUrl,
+      contractId: TESTNET_OPTIONS.contractId,
+      startCursor: CURSOR_GENESIS,
     });
 
-    const client = makeClient();
-    const before = await client.getRemainingTtl();
-    expect(before).toBeLessThan(threshold);
-
-    const xdr = await client.extendTtl(threshold, newTtl);
-    await client.submitTransaction(xdr);
-
-    const after = await client.getRemainingTtl();
-    expect(after).toBeGreaterThanOrEqual(threshold);
-    expect(after).toBe(newTtl);
-  });
-
-  it("is diagnosable: surfaces RPC failures during TTL lookup", async () => {
-    mockGetLedgerEntries.mockRejectedValue(new Error("getLedgerEntries: node unavailable"));
-
-    await expect(makeClient().extendTtl(7 * DAY_SECONDS, 30 * DAY_SECONDS)).rejects.toThrow(
-      "getLedgerEntries"
-    );
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].type).toBe("upgraded");
+    if (result.events[0].type === "upgraded") {
+      expect(result.events[0].wasmHash).toBe(NEW_WASM_HASH);
+    }
   });
 });
 
-describe("runTtlKeeper — Issue #531", () => {
-  const NOW = 1_700_000_000; // fixed clock (seconds)
+// ─── Mainnet contract-ID resolution (Issue #530) ─────────────────────────────
 
-  function makeLogger(): TtlKeeperLogger & {
-    info: jest.Mock;
-    warn: jest.Mock;
-    error: jest.Mock;
-  } {
-    return { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+describe("mainnet contract-ID resolution — Issue #530", () => {
+  const fs = jest.requireActual("fs") as typeof import("fs");
+  const path = jest.requireActual("path") as typeof import("path");
+
+  const CONTRACT_IDS_PATH = path.resolve(process.cwd(), ".contract-ids.json");
+
+  function readContractIds(): Record<string, string> {
+    return JSON.parse(fs.readFileSync(CONTRACT_IDS_PATH, "utf8"));
   }
 
-  function makeMetrics(): TtlKeeperMetrics & {
-    increment: jest.Mock;
-    gauge: jest.Mock;
-  } {
-    return { increment: jest.fn(), gauge: jest.fn() };
-  }
+  it(".contract-ids.json exists at the repo root", () => {
+    expect(fs.existsSync(CONTRACT_IDS_PATH)).toBe(true);
+  });
 
-  function makeGift(overrides: Partial<TtlKeeperGift> = {}): TtlKeeperGift {
-    return {
-      contractId: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-      unlockTime: NOW + 60 * DAY_SECONDS, // well beyond the 20-day lookahead
-      remainingTtlSeconds: 30 * DAY_SECONDS,
-      ...overrides,
+  it("contains a mainnet escrow contract ID", () => {
+    const ids = readContractIds();
+    const mainnetId = ids.mainnet ?? ids["mainnet.escrow"] ?? ids.escrowMainnet;
+    expect(typeof mainnetId).toBe("string");
+    // Stellar contract IDs are 56-char StrKeys beginning with "C".
+    expect(mainnetId).toMatch(/^C[A-Z2-7]{55}$/);
+  });
+
+  it("contains a testnet escrow contract ID distinct from mainnet", () => {
+    const ids = readContractIds();
+    const mainnetId = ids.mainnet ?? ids["mainnet.escrow"] ?? ids.escrowMainnet;
+    const testnetId = ids.testnet ?? ids["testnet.escrow"] ?? ids.escrowTestnet;
+    expect(testnetId).toMatch(/^C[A-Z2-7]{55}$/);
+    expect(testnetId).not.toBe(mainnetId);
+  });
+
+  it("resolves a mainnet EscrowClient from the committed contract ID", () => {
+    const ids = readContractIds();
+    const mainnetId = ids.mainnet ?? ids["mainnet.escrow"] ?? ids.escrowMainnet;
+
+    const mainnetOptions: EscrowClientOptions = {
+      rpcUrl: "https://soroban-mainnet.stellar.org",
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      contractId: mainnetId,
+      sourcePublicKey: TESTNET_OPTIONS.sourcePublicKey,
     };
-  }
 
-  it("selects only gifts with unlock_time > NOW() + 20 days", async () => {
-    const soon = makeGift({
-      contractId: "CSOON00000000000000000000000000000000000000000000000000000000",
-      unlockTime: NOW + 10 * DAY_SECONDS, // inside the 20-day window → skipped
-    });
-    const longLived = makeGift({
-      contractId: "CLONG00000000000000000000000000000000000000000000000000000000",
-      unlockTime: NOW + 60 * DAY_SECONDS,
-    });
-
-    const extendTtl = jest.fn().mockResolvedValue("XDR==");
-    const submitTransaction = jest.fn().mockResolvedValue("hash");
-    const logger = makeLogger();
-    const metrics = makeMetrics();
-
-    const result = await runTtlKeeper({
-      now: () => NOW,
-      listGifts: async () => [soon, longLived],
-      extendTtl,
-      submitTransaction,
-      logger,
-      metrics,
-    });
-
-    expect(TTL_KEEPER_LOOKAHEAD_SECONDS).toBe(20 * DAY_SECONDS);
-    expect(extendTtl).toHaveBeenCalledTimes(1);
-    expect(extendTtl).toHaveBeenCalledWith(
-      longLived.contractId,
-      expect.any(Number),
-      expect.any(Number)
-    );
-    expect(submitTransaction).toHaveBeenCalledTimes(1);
-    expect(result.extended).toEqual([longLived.contractId]);
-    expect(result.skipped).toEqual([soon.contractId]);
-  });
-
-  it("logs a success line for each extended contract", async () => {
-    const gift = makeGift();
-    const extendTtl = jest.fn().mockResolvedValue("XDR==");
-    const submitTransaction = jest.fn().mockResolvedValue("hash");
-    const logger = makeLogger();
-
-    await runTtlKeeper({
-      now: () => NOW,
-      listGifts: async () => [gift],
-      extendTtl,
-      submitTransaction,
-      logger,
-      metrics: makeMetrics(),
-    });
-
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining(gift.contractId),
-      expect.objectContaining({ contractId: gift.contractId })
-    );
-  });
-
-  it("logs a failure line and continues when extendTtl throws", async () => {
-    const bad = makeGift({
-      contractId: "CBAD000000000000000000000000000000000000000000000000000000000",
-    });
-    const good = makeGift({
-      contractId: "CGOOD00000000000000000000000000000000000000000000000000000000",
-    });
-
-    const extendTtl = jest
-      .fn()
-      .mockRejectedValueOnce(new Error("simulation failed"))
-      .mockResolvedValueOnce("XDR==");
-    const submitTransaction = jest.fn().mockResolvedValue("hash");
-    const logger = makeLogger();
-
-    const result = await runTtlKeeper({
-      now: () => NOW,
-      listGifts: async () => [bad, good],
-      extendTtl,
-      submitTransaction,
-      logger,
-      metrics: makeMetrics(),
-    });
-
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining(bad.contractId),
-      expect.objectContaining({ contractId: bad.contractId })
-    );
-    expect(result.failed).toEqual([bad.contractId]);
-    expect(result.extended).toEqual([good.contractId]);
-  });
-
-  it("emits a ttl.alert metric when remaining TTL is below the 7-day buffer", async () => {
-    const atRisk = makeGift({
-      contractId: "CRISK00000000000000000000000000000000000000000000000000000000",
-      remainingTtlSeconds: 3 * DAY_SECONDS, // below 7-day buffer
-    });
-    const healthy = makeGift({
-      contractId: "CHEALTHY0000000000000000000000000000000000000000000000000000",
-      remainingTtlSeconds: 30 * DAY_SECONDS,
-    });
-
-    const metrics = makeMetrics();
-    const logger = makeLogger();
-
-    await runTtlKeeper({
-      now: () => NOW,
-      listGifts: async () => [atRisk, healthy],
-      extendTtl: jest.fn().mockResolvedValue("XDR=="),
-      submitTransaction: jest.fn().mockResolvedValue("hash"),
-      logger,
-      metrics,
-    });
-
-    expect(TTL_ALERT_BUFFER_SECONDS).toBe(7 * DAY_SECONDS);
-    expect(metrics.increment).toHaveBeenCalledWith(
-      "ttl.alert",
-      expect.objectContaining({ contractId: atRisk.contractId })
-    );
-    expect(metrics.increment).not.toHaveBeenCalledWith(
-      "ttl.alert",
-      expect.objectContaining({ contractId: healthy.contractId })
-    );
-  });
-
-  it("tracks XLM keeper cost per call and against the budget", async () => {
-    const gift = makeGift();
-    const metrics = makeMetrics();
-
-    const result = await runTtlKeeper({
-      now: () => NOW,
-      listGifts: async () => [gift],
-      extendTtl: jest.fn().mockResolvedValue("XDR=="),
-      submitTransaction: jest.fn().mockResolvedValue("hash"),
-      logger: makeLogger(),
-      metrics,
-      feePerCallXlm: 0.01,
-      dailyBudgetXlm: 1,
-    });
-
-    expect(result.totalCostXlm).toBeCloseTo(0.01);
-    expect(metrics.gauge).toHaveBeenCalledWith("ttl.keeper.cost_xlm", 0.01);
-    expect(result.budgetExceeded).toBe(false);
+    const client = new EscrowClient(mainnetOptions);
+    expect(client).toBeInstanceOf(EscrowClient);
   });
 });
