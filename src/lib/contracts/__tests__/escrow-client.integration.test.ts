@@ -41,6 +41,7 @@ const mockGetAccount = jest.fn();
 const mockSendTransaction = jest.fn();
 const mockGetTransaction = jest.fn();
 const mockGetEvents = jest.fn();
+const mockGetLedgerEntries = jest.fn();
 
 jest.mock("@stellar/stellar-sdk", () => {
   const actual = jest.requireActual("@stellar/stellar-sdk");
@@ -51,6 +52,7 @@ jest.mock("@stellar/stellar-sdk", () => {
     sendTransaction = mockSendTransaction;
     getTransaction = mockGetTransaction;
     getEvents = mockGetEvents;
+    getLedgerEntries = mockGetLedgerEntries;
   }
 
   class MockContract {
