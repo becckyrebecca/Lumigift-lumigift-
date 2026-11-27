@@ -53,7 +53,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
 
     log.info({ durationMs }, "[cron/expire] run complete");
 
-    await pingHealthcheck(); // success ping
+    await pingHealthcheck("expire"); // success ping
 
     return NextResponse.json<ApiResponse<{ message: string; durationMs: number }>>({
       success: true,
@@ -64,7 +64,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
     log.error({ startedAt, err }, "[cron/expire] run failed");
     recordCronFailure("cron/v1/expire", durationMs, err);
     await recordDeadLetter("cron/v1/expire", durationMs, err);
-    await pingHealthcheck("/fail"); // failure ping
+    await pingHealthcheck("expire", "/fail"); // failure ping
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Expiry job failed" },
       { status: 500 }

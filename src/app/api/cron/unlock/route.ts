@@ -36,6 +36,9 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
     recordCronSuccess("cron/unlock", durationMs, { unlocked });
     log.info({ unlocked, durationMs }, "[cron/unlock] run complete");
 
+    // Ping only after the job has completed successfully.
+    await pingCronHealthcheck("cron/unlock", { status: "success" });
+
     return NextResponse.json<ApiResponse<{ unlocked: number }>>({
       success: true,
       data: { unlocked },

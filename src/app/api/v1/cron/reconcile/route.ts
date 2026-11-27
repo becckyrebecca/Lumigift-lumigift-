@@ -63,7 +63,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
       "[cron/reconcile] run complete"
     );
 
-    await pingHealthcheck(); // success ping
+    await pingCronHealthcheck("reconcile"); // success ping (after completion)
 
     return NextResponse.json<
       ApiResponse<
@@ -87,7 +87,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
     log.error({ err, durationMs }, "[cron/reconcile] run failed");
     recordCronFailure("cron/v1/reconcile", durationMs, err);
     await recordDeadLetter("cron/v1/reconcile", durationMs, err);
-    await pingHealthcheck("/fail"); // failure ping
+    await pingCronHealthcheck("reconcile", "/fail"); // failure ping
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Reconciliation job failed" },
       { status: 500 }

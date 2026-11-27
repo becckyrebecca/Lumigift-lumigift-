@@ -55,7 +55,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
 
     log.info({ ...result, durationMs }, "[cron/index-events] run complete");
 
-    await pingHealthcheck(); // success ping
+    await pingCronHealthcheck("index-events"); // success ping
 
     return NextResponse.json<
       ApiResponse<{ processed: number; skipped: number; latestCursor: string; durationMs: number }>
@@ -68,7 +68,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
     log.error({ err, durationMs }, "[cron/index-events] run failed");
     recordCronFailure("cron/v1/index-events", durationMs, err);
     await recordDeadLetter("cron/v1/index-events", durationMs, err);
-    await pingHealthcheck("/fail"); // failure ping
+    await pingCronHealthcheck("index-events", "/fail"); // failure ping
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Event indexing failed" },
       { status: 500 }
