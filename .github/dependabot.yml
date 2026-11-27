@@ -26,10 +26,12 @@ updates:
       - "dependencies"
       - "rust"
 
-  - package-ecosystem: "cargo"
-    directory: "/contracts/escrow"
+  - package-ecosystem: "terraform"
+    directory: "/infra/terraform"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
-      - "rust"
+      - "terraform"
+      - "devops"
