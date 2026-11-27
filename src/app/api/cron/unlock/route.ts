@@ -3,7 +3,8 @@ import { processUnlocks } from "@/server/services/scheduler.service";
 import { startTimer, recordCronSuccess, recordCronFailure } from "@/lib/metrics";
 import type { ApiResponse } from "@/types";
 import { isAuthorizedCronRequest } from "@/server/cron-auth";
-import { pingCronHealthcheck } from "@/server/cron-healthcheck";
+import { withErrorHandler } from "@/server/middleware";
+import { requestLogger, getCorrelationId } from "@/lib/logger";
 
 /**
  * GET /api/cron/unlock
@@ -12,13 +13,12 @@ import { pingCronHealthcheck } from "@/server/cron-healthcheck";
  * `unlockAt` timestamp has passed.
  *
  * Authentication: Bearer token checked against CRON_SECRET env var.
- *
- * Monitoring: On success, pings the configured Healthchecks.io check
- * (CRON_UNLOCK_HEALTHCHECK_URL) to confirm completion. On failure, pings
- * the /fail endpoint so missed/failed runs alert within 5 minutes.
+ * Wrapped with `withErrorHandler` so every response (success or failure)
+ * carries a request/correlation ID and is logged against it (#509).
  */
-export async function GET(req: NextRequest) {
+export const GET = withErrorHandler(async (req: NextRequest) => {
   const authHeader = req.headers.get("authorization");
+  const log = requestLogger(getCorrelationId(req.headers));
 
   if (!isAuthorizedCronRequest(authHeader)) {
     return NextResponse.json<ApiResponse<never>>(
@@ -34,6 +34,7 @@ export async function GET(req: NextRequest) {
     const durationMs = elapsed();
 
     recordCronSuccess("cron/unlock", durationMs, { unlocked });
+    log.info({ unlocked, durationMs }, "[cron/unlock] run complete");
 
     // Ping only after the job has completed successfully.
     await pingCronHealthcheck("cron/unlock", { status: "success" });
@@ -45,13 +46,10 @@ export async function GET(req: NextRequest) {
   } catch (err) {
     const durationMs = elapsed();
     recordCronFailure("cron/unlock", durationMs, err);
-
-    // Signal failure to the healthcheck so alerts fire promptly.
-    await pingCronHealthcheck("cron/unlock", { status: "fail" });
-
+    log.error({ err, durationMs }, "[cron/unlock] run failed");
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Cron job failed" },
       { status: 500 }
     );
   }
-}
+});

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { processOccasionReminders } from "@/server/services/occasion.service";
 import type { ApiResponse } from "@/types";
 import { isAuthorizedCronRequest } from "@/server/cron-auth";
+import { withErrorHandler } from "@/server/middleware";
+import { requestLogger, getCorrelationId } from "@/lib/logger";
 
 const HEALTHCHECK_URL = process.env.HEALTHCHECK_URL_OCCASION_REMINDERS;
 
@@ -30,8 +32,12 @@ const pingHealthcheck = async (failed: boolean): Promise<void> => {
  *
  * Called daily at 09:00 UTC by Vercel Cron (see vercel.json). Sends an SMS
  * reminder 7 days before each saved occasion with reminders enabled (issue #341).
+ *
+ * Wrapped with `withErrorHandler` so every response carries a
+ * request/correlation ID and is logged against it (#509).
  */
-export const GET = async (req: NextRequest) => {
+export const GET = withErrorHandler(async (req: NextRequest) => {
+  const log = requestLogger(getCorrelationId(req.headers));
   if (!isAuthorizedCronRequest(req.headers.get("authorization"))) {
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Unauthorized" },
@@ -41,15 +47,13 @@ export const GET = async (req: NextRequest) => {
 
   try {
     const sent = await processOccasionReminders();
-    console.log("[cron/occasion-reminders] run complete", { sent });
-    await pingHealthcheck(false);
+    log.info({ sent }, "[cron/occasion-reminders] run complete");
     return NextResponse.json<ApiResponse<{ sent: number }>>({ success: true, data: { sent } });
   } catch (err) {
-    console.error("[cron/occasion-reminders] run failed", { error: err });
-    await pingHealthcheck(true);
+    log.error({ err }, "[cron/occasion-reminders] run failed");
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Occasion reminder job failed" },
       { status: 500 }
     );
   }
-};
+});
